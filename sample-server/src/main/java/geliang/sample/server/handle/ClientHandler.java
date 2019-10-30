@@ -1,26 +1,51 @@
 package geliang.sample.server.handle;
 
 
+import geliang.library.clink.core.Connector;
 import geliang.library.clink.utils.CloseUtils;
+import jdk.internal.org.objectweb.asm.ByteVector;
 
 import java.io.*;
-import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.SocketChannel;
+import java.util.Iterator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class ClientHandler {
-    private final Socket socket;
-    private final ClientReadHandler readHandler;
+    private final SocketChannel socketChannel;
+    private final Connector connector;
     private final ClientWriteHandler writeHandler;
     private final ClientHandlerCallback clientHandlerCallback;
     private final String clientInfo;
 
-    public ClientHandler(Socket socket, ClientHandlerCallback clientHandlerCallback) throws IOException {
-        this.socket = socket;
-        this.readHandler = new ClientReadHandler(socket.getInputStream());
-        this.writeHandler = new ClientWriteHandler(socket.getOutputStream());
+    public ClientHandler(SocketChannel socketChannel, ClientHandlerCallback clientHandlerCallback) throws IOException {
+        this.socketChannel = socketChannel;
+
+        connector = new Connector(){
+            @Override
+            protected void onReceiveNewMessage(String str) {
+                super.onReceiveNewMessage(str);
+                clientHandlerCallback.onNewMessageArrived(ClientHandler.this, str);
+            }
+
+            @Override
+            public void onChannelClosed(SocketChannel channel) {
+                super.onChannelClosed(channel);
+                exitBySelf();
+            }
+        };
+        connector.setup(socketChannel);
+
+
+        Selector writeSelector = Selector.open();
+        socketChannel.register(writeSelector, SelectionKey.OP_WRITE);
+        this.writeHandler = new ClientWriteHandler(writeSelector);
+
         this.clientHandlerCallback = clientHandlerCallback;
-        this.clientInfo = "A[" + this.socket.getInetAddress() + "] P[" + this.socket.getPort() + "]";
+        this.clientInfo = socketChannel.getRemoteAddress().toString();
         System.out.println("新客户端：" + clientInfo);
     }
 
@@ -29,17 +54,14 @@ public class ClientHandler {
     }
 
     public void exit() {
-        readHandler.exit();
+        CloseUtils.close(connector);
         writeHandler.exit();
-        CloseUtils.close(socket);
+        CloseUtils.close(socketChannel);
+        System.out.println("客户端已经退出：" + clientInfo);
     }
 
     public void send(String str) {
         writeHandler.send(str);
-    }
-
-    public void readToPrint() {
-        readHandler.start();
     }
 
     private void exitBySelf() {
@@ -55,59 +77,16 @@ public class ClientHandler {
         void onNewMessageArrived(ClientHandler handler, String msg);
     }
 
-    class ClientReadHandler extends Thread {
-
-        private boolean done = false;
-        private final InputStream inputStream;
-
-        public ClientReadHandler(InputStream inputStream) {
-            this.inputStream = inputStream;
-        }
-
-        @Override
-        public void run() {
-            super.run();
-            System.out.println("新客户端：" + socket.getInetAddress() + " P:" + socket.getPort());
-
-            try {
-                // 得到输入流用于接收数据
-                BufferedReader socketInput = new BufferedReader(new InputStreamReader(inputStream));
-                do {
-                    String string = socketInput.readLine();
-                    if (string == null) {
-                        System.out.println("客户端已无法读取数据");
-                        // 退出当前客户端
-                        ClientHandler.this.exitBySelf();
-                        break;
-                    }
-                    // 打印到屏幕上
-                    System.out.println(string);
-                    clientHandlerCallback.onNewMessageArrived(ClientHandler.this, string);
-                } while (!done);
-            } catch (Exception e) {
-                if (!done) {
-                    System.out.println("连接异常断开");
-                    ClientHandler.this.exitBySelf();
-                }
-
-            } finally {
-                CloseUtils.close(inputStream);
-            }
-            System.out.println("客户端已经关闭...");
-        }
-        void exit() {
-            done = true;
-            CloseUtils.close(inputStream);
-        }
-    }
 
     class ClientWriteHandler {
         private boolean done = false;
-        private final PrintStream printStream;
+        private final Selector selector;
+        private final ByteBuffer byteBuffer;
         private final ExecutorService executorService;
 
-        public ClientWriteHandler(OutputStream outputStream) {
-            this.printStream = new PrintStream(outputStream);
+        public ClientWriteHandler(Selector selector) {
+            this.selector = selector;
+            this.byteBuffer = ByteBuffer.allocate(256);
             this.executorService = Executors.newSingleThreadExecutor();
         }
 
@@ -120,7 +99,8 @@ public class ClientHandler {
 
         void exit() {
             done = true;
-            CloseUtils.close(printStream);
+            selector.wakeup();
+            CloseUtils.close(selector);
             executorService.shutdownNow();
         }
 
@@ -129,7 +109,8 @@ public class ClientHandler {
             private final String msg;
 
             public WriteRunnable(String msg) {
-                this.msg = msg;
+
+                this.msg = msg + "\n";
             }
 
             @Override
@@ -139,10 +120,24 @@ public class ClientHandler {
                     return;
                 }
 
-                try {
-                    ClientWriteHandler.this.printStream.println(msg);
-                } catch (Exception e) {
-                    e.printStackTrace();
+                byteBuffer.clear();
+                byteBuffer.put(msg.getBytes());
+                // 反转操作，将指针从新指向起始位置
+                byteBuffer.flip();
+
+                while (!done && byteBuffer.hasRemaining()) {
+                    try {
+                        final int len = socketChannel.write(byteBuffer);
+                        // len = 0合法
+                        if (len < 0) {
+                            System.out.println("客户端已经无法发送数据");
+                            ClientHandler.this.exitBySelf();
+                            break;
+                        }
+
+                    } catch (Exception e) {
+
+                    }
                 }
             }
         }

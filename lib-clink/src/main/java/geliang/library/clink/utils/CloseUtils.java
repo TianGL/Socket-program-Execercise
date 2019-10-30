@@ -2,9 +2,10 @@ package geliang.library.clink.utils;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.PrintStream;
 
 public class CloseUtils {
-    public static void close(Closeable... closeables) {
+    public static void close(Closeable...closeables) {
         if (closeables == null) {
             return;
         }
